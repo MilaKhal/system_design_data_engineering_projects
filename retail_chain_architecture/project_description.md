@@ -25,6 +25,15 @@ XYZ Retail is a global retailer with both physical and e‑commerce operations. 
 XYZ Retail will centralize streaming and batch sources into an **S3** landing zone with **Snowflake** as the canonical warehouse. Real-time sources (POS, Shopify-like e-commerce, Salesforce) stream through **Kinesis** and **Firehose** to **S3**; **S3** events via an **SQS queue** feed **Snowpipe**  which loads raw tables in **Snowflake**. **Snowflake** **Streams and Tasks** process the raw stream into staging and production tables for BI (Tableau/Power BI) and ML (Databricks/SageMaker). This design leverages **Snowflake** time-travel capabilities to meet audit/versioning requirements while maintaining **S3** as the immutable ground truth for portability and cost control.
 <img width="1120" height="810" alt="retail_chain_diagram drawio" src="https://github.com/user-attachments/assets/67ccc8a1-edd2-4968-9e05-ca0c7bc94fc8" />
 
+**Why this design?**
+ - **Time travel & ACID for analytics**: Snowflake provides built-in time-travel and easy point-in-time recovery — a direct match to the requirement for audits and debugging.
+ - **Durable, cost-efficient landing store**: S3 holds raw immutable JSON and acts as the replayable source-of-truth.
+ - **Low-latency ingestion**: Kinesis + Firehose + Snowpipe provides a managed, scalable ingestion path with near real-time behavior.
+ - **Familiar BI & ML workflows**: Snowflake acts as an SQL-first warehouse for Tableau and BI; Databricks can access Snowflake for feature engineering and model development.
+ - **Phased modernization**: Existing ETL (Informatica/SSIS) can be repointed to S3 or co-exist while migration proceeds.
+
+## Additional Considerations
+
 ### PII Compliance
 1. **Encryption**:
    - S3 → Server-Side Encryption with KMS (SSE-KMS).
@@ -38,3 +47,20 @@ XYZ Retail will centralize streaming and batch sources into an **S3** landing zo
      - Analysts → can query masked views only.
      - Data science team → can use encrypted tokens for segmentation.
      - Marketing ops → can call a Re-ID microservice that decrypts under strict approval.
+   
+### Deduplication & Ordering
+Kinesis + Firehose → S3 + Snowpipe can produce duplicated events (retries), partially-ordered data, and out-of-order delivery. When using CDC + event streams, duplicates or ordering issues break correctness (inventory, reconciliation).
+ - **Mitigation**:
+   - Adding a **unique event id** + **producer timestamp** to each event at the source or ingestion Lambda.
+   - Dedupe layer: Snowflake staging step (raw → staging) that dedupes on (event_id, source).
+   - For CDC from Oracle, DMS writes LSN/SCN (log sequence number) and operation type (INSERT/UPDATE/DELETE), reconcile ordering in Snowflake.
+
+### Data Quality
+- Potential JSON schema changes from Salesforce/Shopify:
+   - Introducing a **Glue Schema Registry**
+   - Validating incoming data at **Lambda** ingestion.
+- **dbt tests** (data quality rules) via Streams/Tasks in Snowflake (uniqueness, not_null, accepted_values, relationships).
+
+### Small Files & Cost Optimization
+- Firehose can generate many small objects (especially at high partitioning), causing explosion in file counts and query inefficiency (Snowflake ingestion cost and later processing).
+  - Tuning Firehose buffer_size/buffer_interval to produce optimally-sized files (e.g., 64–256MB compressed)
